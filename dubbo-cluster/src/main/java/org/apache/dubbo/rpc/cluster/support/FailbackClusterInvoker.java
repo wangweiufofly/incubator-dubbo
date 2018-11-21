@@ -16,6 +16,10 @@
  */
 package org.apache.dubbo.rpc.cluster.support;
 
+import com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap;
+import com.googlecode.concurrentlinkedhashmap.EvictionListener;
+import org.apache.dubbo.common.Constants;
+import org.apache.dubbo.common.URL;
 import org.apache.dubbo.common.logger.Logger;
 import org.apache.dubbo.common.logger.LoggerFactory;
 import org.apache.dubbo.common.threadlocal.NamedInternalThreadFactory;
@@ -31,19 +35,18 @@ import org.apache.dubbo.rpc.cluster.LoadBalance;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * When fails, record failure requests and schedule for retry on a regular interval.
  * Especially useful for services of notification.
  *
  * <a href="http://en.wikipedia.org/wiki/Failback">Failback</a>
- *
  */
 public class FailbackClusterInvoker<T> extends AbstractClusterInvoker<T> {
 
@@ -58,11 +61,33 @@ public class FailbackClusterInvoker<T> extends AbstractClusterInvoker<T> {
     private final ScheduledExecutorService scheduledExecutorService = Executors.newScheduledThreadPool(2,
             new NamedInternalThreadFactory("failback-cluster-timer", true));
 
-    private final ConcurrentMap<Invocation, AbstractClusterInvoker<?>> failed = new ConcurrentHashMap<>();
+    private volatile ConcurrentMap<Invocation, FailbackRetryInvoker<?>> failed;
+    private volatile int maxRetry;
     private volatile ScheduledFuture<?> retryFuture;
 
     public FailbackClusterInvoker(Directory<T> directory) {
         super(directory);
+        init();
+    }
+
+    private void init() {
+        maxRetry = getUrl().getParameter(Constants.RETRIES_KEY, Constants.DEFAULT_FAIL_RETRY_SIZE) + 1;
+        if (maxRetry <= 0) {
+            maxRetry = Constants.DEFAULT_FAIL_RETRY_SIZE;
+        }
+        /*
+         * lru
+         */
+        long failCapacitySize = getUrl().getParameter(Constants.FAIL_CAPACITY_KEY, Constants.DEFAULT_FAIL_CAPACITY_SIZE);
+        failed = new ConcurrentLinkedHashMap.Builder<Invocation, FailbackRetryInvoker<?>>()
+                .maximumWeightedCapacity(failCapacitySize).listener(new EvictionListener<Invocation, FailbackRetryInvoker<?>>() {
+                    @Override
+                    public void onEviction(Invocation invocation, FailbackRetryInvoker abstractClusterInvoker) {
+                        if (logger.isWarnEnabled()) {
+                            logger.warn("Failback background works is too much,We have to abandon,invocation->" + invocation);
+                        }
+                    }
+                }).build();
     }
 
     private void addFailed(Invocation invocation, AbstractClusterInvoker<?> router) {
@@ -84,21 +109,27 @@ public class FailbackClusterInvoker<T> extends AbstractClusterInvoker<T> {
                 }
             }
         }
-        failed.put(invocation, router);
+        failed.put(invocation, new FailbackRetryInvoker(router));
     }
 
     void retryFailed() {
         if (failed.size() == 0) {
             return;
         }
-        for (Map.Entry<Invocation, AbstractClusterInvoker<?>> entry : new HashMap<>(failed).entrySet()) {
+        for (Map.Entry<Invocation, FailbackRetryInvoker<?>> entry : new HashMap<>(failed).entrySet()) {
             Invocation invocation = entry.getKey();
-            Invoker<?> invoker = entry.getValue();
+            FailbackRetryInvoker<?> invoker = entry.getValue();
             try {
                 invoker.invoke(invocation);
                 failed.remove(invocation);
             } catch (Throwable e) {
                 logger.error("Failed retry to invoke method " + invocation.getMethodName() + ", waiting again.", e);
+                if (invoker.retrys.get()>=this.maxRetry){
+                    failed.remove(invocation);
+                    if (logger.isWarnEnabled()) {
+                        logger.warn("Failed retry times exceed threshold,We have to abandon,invocation->" + invocation);
+                    }
+                }
             }
         }
     }
@@ -117,4 +148,43 @@ public class FailbackClusterInvoker<T> extends AbstractClusterInvoker<T> {
         }
     }
 
+    @Override
+    protected void afterDestroy() {
+        scheduledExecutorService.shutdown();
+    }
+
+    static class FailbackRetryInvoker<L> implements Invoker<L> {
+        private AbstractClusterInvoker<L> invoker;
+        private AtomicInteger retrys = new AtomicInteger(0);
+
+        public FailbackRetryInvoker(AbstractClusterInvoker<L> invoker) {
+            this.invoker = invoker;
+        }
+
+        @Override
+        public Class getInterface() {
+            return invoker.getInterface();
+        }
+
+        @Override
+        public Result invoke(Invocation invocation) throws RpcException {
+            retrys.incrementAndGet();
+            return invoker.invoke(invocation);
+        }
+
+        @Override
+        public URL getUrl() {
+            return invoker.getUrl();
+        }
+
+        @Override
+        public boolean isAvailable() {
+            return invoker.isAvailable();
+        }
+
+        @Override
+        public void destroy() {
+            invoker.destroy();
+        }
+    }
 }

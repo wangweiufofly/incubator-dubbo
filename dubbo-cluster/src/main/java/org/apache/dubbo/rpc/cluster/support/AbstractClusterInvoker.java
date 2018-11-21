@@ -91,9 +91,15 @@ public abstract class AbstractClusterInvoker<T> implements Invoker<T> {
     public void destroy() {
         if (destroyed.compareAndSet(false, true)) {
             directory.destroy();
+            afterDestroy();
         }
     }
 
+    /**
+     * afterDestroy
+     */
+    protected void afterDestroy() {
+    }
     /**
      * Select a invoker using loadbalance policy.</br>
      * a) Firstly, select an invoker using loadbalance. If this invoker is in previously selected list, or,
